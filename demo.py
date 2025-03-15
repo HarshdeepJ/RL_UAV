@@ -37,24 +37,39 @@ class UAVTerrainEnv(gym.Env):
         # Altitude bounds for the UAV (terrain_min to UAV max altitude)
         self.z_bounds = (self.terrain_min, self.uav_max_altitude)
         
-        # Set number of enemy radars (if needed, default is 1 here, but can be extended)
+        # Set number of enemy radars
         self.num_radars = 3
+        
+        # --- Enemy radar parameters ---
+        # Initialize enemy radars before generating the goal, so that they are used in safe sampling.
+        self.enemy_radar_pos = np.array([
+            [np.random.uniform(*self.x_bounds), np.random.uniform(*self.y_bounds)]
+            for _ in range(self.num_radars)
+        ])
+        self.enemy_radar_radius = 1.0      # Danger zone radius (applied to all radars)
+        self.uav_sensor_radius = 2.0       # UAV sensor detection radius (applied to all radars)
+        
+        # Timer array to accumulate time in each enemy radar's danger zone (for missile hit probability)
+        self.time_in_radar = np.zeros(self.num_radars)
+        
+        # List to store detected enemy radar locations (once detected, remains for the episode)
+        self.detected_radar_locations = []
         
         # Define observation space: [UAV pos (3), velocity (3), goal (3), enemy radar positions (2*num_radars), enemy radar detection flags (num_radars)]
         obs_low = np.concatenate([
-            np.array([self.x_bounds[0], self.y_bounds[0], self.z_bounds[0]]),   # UAV position low
-            np.array([-5, -5, -5]),                                              # Velocity low
-            np.array([self.x_bounds[0], self.y_bounds[0], self.z_bounds[0]]),      # Goal position low
-            np.tile(np.array([self.x_bounds[0], self.y_bounds[0]]), self.num_radars), # Radar positions low
-            np.zeros(self.num_radars)                                            # Radar detection flags (0 means not detected)
+            np.array([self.x_bounds[0], self.y_bounds[0], self.z_bounds[0]]),    # UAV position low
+            np.array([-5, -5, -5]),                                               # Velocity low
+            np.array([self.x_bounds[0], self.y_bounds[0], self.z_bounds[0]]),       # Goal position low
+            np.tile(np.array([self.x_bounds[0], self.y_bounds[0]]), self.num_radars),# Radar positions low
+            np.zeros(self.num_radars)                                             # Detection flags low
         ]).astype(np.float32)
         
         obs_high = np.concatenate([
-            np.array([self.x_bounds[1], self.y_bounds[1], self.z_bounds[1]]),      # UAV position high
-            np.array([5, 5, 5]),                                                 # Velocity high
-            np.array([self.x_bounds[1], self.y_bounds[1], self.z_bounds[1]]),      # Goal position high
-            np.tile(np.array([self.x_bounds[1], self.y_bounds[1]]), self.num_radars), # Radar positions high
-            np.ones(self.num_radars)                                             # Radar detection flags (1 means detected)
+            np.array([self.x_bounds[1], self.y_bounds[1], self.z_bounds[1]]),       # UAV position high
+            np.array([5, 5, 5]),                                                  # Velocity high
+            np.array([self.x_bounds[1], self.y_bounds[1], self.z_bounds[1]]),       # Goal position high
+            np.tile(np.array([self.x_bounds[1], self.y_bounds[1]]), self.num_radars),# Radar positions high
+            np.ones(self.num_radars)                                              # Detection flags high
         ]).astype(np.float32)
         
         self.observation_space = spaces.Box(low=obs_low, high=obs_high, dtype=np.float32)
@@ -68,16 +83,11 @@ class UAVTerrainEnv(gym.Env):
         # Collision margin: UAV must remain above terrain by at least this much
         self.collision_margin = 0.1
         
-        # Generate enemy radars: positions (num_radars x 2)
-        self.enemy_radar_pos = np.array([
-            [np.random.uniform(*self.x_bounds), np.random.uniform(*self.y_bounds)]
-            for _ in range(self.num_radars)
-        ])
-        self.enemy_radar_radius = 4.0      # Danger zone radius (applied to all radars)
-        self.uav_sensor_radius = 2.0       # UAV sensor detection radius (applied to all radars)
+        # Generate goal position (safe-sampled)
+        self.goal = self._generate_goal_position()
         
-        # Timer array to accumulate time in each enemy radar's danger zone
-        self.time_in_radar = np.zeros(self.num_radars)
+        # For tracking the UAV's trajectory (for visualization)
+        self.trajectory = []
         
         # Pygame window parameters (if rendering)
         self.window_width = 800
@@ -86,7 +96,7 @@ class UAVTerrainEnv(gym.Env):
         self.reset()
     
     def is_in_enemy_zone(self, pos2d):
-        """Check if a 2D position is within any enemy radar's danger zone."""
+        """Return True if pos2d is within any enemy radar's danger zone."""
         for radar in self.enemy_radar_pos:
             if np.linalg.norm(pos2d - radar) < self.enemy_radar_radius:
                 return True
@@ -106,8 +116,9 @@ class UAVTerrainEnv(gym.Env):
     
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
-        # Reset timer for radar exposure
         self.time_in_radar = np.zeros(self.num_radars)
+        # Reset the detected radar locations list
+        self.detected_radar_locations = []
         # Sample initial position until it's outside any enemy radar zone.
         while True:
             x_init = np.random.uniform(*self.x_bounds)
@@ -120,16 +131,13 @@ class UAVTerrainEnv(gym.Env):
         self.position = np.array([x_init, y_init, z_init], dtype=np.float32)
         self.velocity = np.zeros(3, dtype=np.float32)
         self.goal = self._generate_goal_position()
-        # Initially, radar detection flags are all zeros (not detected)
         detection_flags = np.zeros(self.num_radars)
         self.state = np.concatenate([self.position, self.velocity, self.goal, self.enemy_radar_pos.flatten(), detection_flags])
         self.trajectory = [self.position.copy()]
         return self.state, {}
     
     def step(self, action):
-        # Clip action
         action = np.clip(action, self.action_space.low, self.action_space.high)
-        # Update dynamics
         self.velocity += action * self.dt
         self.position += self.velocity * self.dt
         self.position[0] = np.clip(self.position[0], *self.x_bounds)
@@ -139,7 +147,6 @@ class UAVTerrainEnv(gym.Env):
         min_z = max(self.z_bounds[0], ground_elev + self.collision_margin)
         self.position[2] = np.clip(self.position[2], min_z, self.z_bounds[1])
         
-        # --- Radar detection and missile hit probability ---
         detection_flags = np.zeros(self.num_radars)
         p_list = []
         for i, radar in enumerate(self.enemy_radar_pos):
@@ -147,29 +154,29 @@ class UAVTerrainEnv(gym.Env):
             # Set detection flag if within sensor range
             if dist_to_radar < self.uav_sensor_radius:
                 detection_flags[i] = 1.0
+                # If not already stored, add this radar's location to detected list
+                if not any(np.allclose(radar, r) for r in self.detected_radar_locations):
+                    self.detected_radar_locations.append(radar.copy())
             # Accumulate time if inside danger zone for this radar
             if dist_to_radar < self.enemy_radar_radius:
                 self.time_in_radar[i] += self.dt
             else:
                 self.time_in_radar[i] = 0.0
-            # Compute hit probability for this radar
             p_i = min(1.0, self.time_in_radar[i] / 5.0)
             p_list.append(p_i)
         
-        # Combined missile hit probability: 1 - prod(1 - p_i)
         p_comb = 1 - np.prod([1 - p for p in p_list])
         missile_hit = np.random.rand() < p_comb
         
         if missile_hit and np.any(self.time_in_radar > 0):
             termination_reason = "Hit by missile due to prolonged radar exposure"
-            reward = -100  # Heavy penalty
+            reward = -100
             done = True
-            info = {"termination_reason": termination_reason}
+            info = {"termination_reason": termination_reason, "detected_radars": self.detected_radar_locations}
             self.state = np.concatenate([self.position, self.velocity, self.goal, self.enemy_radar_pos.flatten(), detection_flags])
             self.trajectory.append(self.position.copy())
             return self.state, float(reward), bool(done), False, info
         
-        # Compute extra penalty or bonus based on radar proximity (for each radar)
         extra_penalty = 0
         bonus = 0
         for radar in self.enemy_radar_pos:
@@ -180,7 +187,6 @@ class UAVTerrainEnv(gym.Env):
                 bonus += 10
         
         collision = self.position[2] < ground_elev + self.collision_margin
-        
         self.trajectory.append(self.position.copy())
         distance = np.linalg.norm(self.position - self.goal)
         reward = -distance - extra_penalty + bonus
@@ -193,7 +199,7 @@ class UAVTerrainEnv(gym.Env):
             termination_reason = f"Collision with terrain at ({self.position[0]:.2f}, {self.position[1]:.2f}). Altitude: {self.position[2]:.2f}, Terrain: {ground_elev:.2f}"
         
         done = bool((distance < 0.5) or collision)
-        info = {"termination_reason": termination_reason}
+        info = {"termination_reason": termination_reason, "detected_radars": self.detected_radar_locations}
         self.state = np.concatenate([self.position, self.velocity, self.goal, self.enemy_radar_pos.flatten(), detection_flags])
         return self.state, reward, done, False, info
     
@@ -282,16 +288,22 @@ def run_pygame_controlled_env():
         state, reward, done, _, info = env.step(action)
         if done:
             print("Episode finished! Reason:", info.get("termination_reason"))
+            print("Detected radars:", info.get("detected_radars"))
             env.reset()
         
         screen.blit(terrain_surface, (0, 0))
         
-        # Draw each enemy radar
-        for radar in env.enemy_radar_pos:
+        # Draw each enemy radar; if it has ever been detected (stored in detected_radar_locations), always draw in yellow.
+        for i, radar in enumerate(env.enemy_radar_pos):
             radar_screen = env.env_to_screen(radar[0], radar[1])
             screen_radius = int((env.enemy_radar_radius / (env.x_bounds[1]-env.x_bounds[0])) * window_width)
-            pygame.draw.circle(screen, (255, 0, 0), radar_screen, screen_radius, 2)
-            pygame.draw.circle(screen, (255, 0, 0), radar_screen, 4)
+            # Check if this radar's location is in the detected list.
+            if any(np.allclose(radar, r) for r in env.detected_radar_locations):
+                radar_color = (255, 255, 0)  # Yellow if detected at any time
+            else:
+                radar_color = (255, 0, 0)      # Red otherwise
+            pygame.draw.circle(screen, radar_color, radar_screen, screen_radius, 2)
+            pygame.draw.circle(screen, radar_color, radar_screen, 4)
         
         pos_screen = env.env_to_screen(env.position[0], env.position[1])
         sensor_screen_radius = int((env.uav_sensor_radius / (env.x_bounds[1]-env.x_bounds[0])) * window_width)
@@ -318,3 +330,4 @@ def run_pygame_controlled_env():
 
 if __name__ == "__main__":
     run_pygame_controlled_env()
+    
