@@ -16,7 +16,7 @@ This repository contains a custom OpenAI Gymnasium environment simulating a UAV 
 
 - **Enemy Radar & Missile Threats:**
   - A radar zone is placed randomly within the terrain, representing an enemy surveillance area.
-  - If the UAV enters the radar zone, it has to come under 5 seconds max to max, else will be hit with the probability of 1.
+  - If the UAV enters the radar zone, it has to come under 10 seconds max to max, else will be hit with the probability of 1.
 
 - **Goal-Oriented Navigation:**
   - A randomly generated goal position is set at the start of each episode.
